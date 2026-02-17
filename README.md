@@ -91,11 +91,14 @@ Use time range instead of slot range:
 ## Winner attribution rules
 
 - Default mode is strict:
-  - winner is set only when a relay-delivered trace matches canonical beacon `block_hash`.
+  - winner is set only when relay-delivered trace(s) match canonical beacon `block_hash`.
+  - if multiple relays delivered the same canonical block hash, all matching relays are reported.
+  - for those multi-relay matches, winning reward uses the highest delivered value among the matching relays.
 - If canonical block exists but no relay in your configured relay list matches:
   - winner is reported as `self-built`.
+  - reward is sourced from beacon `block rewards` API when available (`/eth/v1/beacon/rewards/blocks/{slot}`).
 - If `-allow-inferred-winner` is enabled:
-  - when canonical matching is unavailable/ambiguous, winner can be inferred from highest delivered value trace.
+  - when canonical matching is unavailable, winner can be inferred from highest delivered value trace.
 
 ## Retry behavior
 

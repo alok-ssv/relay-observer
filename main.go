@@ -27,6 +27,7 @@ const (
 )
 
 var weiPerETH = new(big.Float).SetInt(big.NewInt(1_000_000_000_000_000_000))
+var gweiPerETH = new(big.Float).SetInt(big.NewInt(1_000_000_000))
 
 type Config struct {
 	BeaconEndpoint string
@@ -65,6 +66,7 @@ type SlotAnalysis struct {
 	Slot              uint64
 	BeaconBlockHash   string
 	WinningRelay      string
+	WinningRelays     []string
 	WinningBlockHash  string
 	WinningValueETH   float64
 	WinningValueKnown bool
@@ -88,6 +90,14 @@ type BidSample struct {
 type winnerCandidate struct {
 	Relay string
 	Trace BidTrace
+}
+
+type relaySlotFetch struct {
+	RelayName    string
+	Bids         []BidTrace
+	Delivered    []BidTrace
+	BuilderErr   error
+	DeliveredErr error
 }
 
 type latenessAgg struct {
@@ -191,6 +201,12 @@ type beaconBlockResponse struct {
 				} `json:"execution_payload_header"`
 			} `json:"body"`
 		} `json:"message"`
+	} `json:"data"`
+}
+
+type beaconBlockRewardResponse struct {
+	Data struct {
+		Total FlexString `json:"total"`
 	} `json:"data"`
 }
 
@@ -540,34 +556,50 @@ func analyzeSingleSlot(
 	}
 
 	candidates := make([]winnerCandidate, 0, len(relays))
-
+	fetchesCh := make(chan relaySlotFetch, len(relays))
+	var relayWG sync.WaitGroup
 	for _, relay := range relays {
-		bids, err := relay.fetchBidTraces(ctx, builderBidsPath, slot)
-		if err != nil {
-			result.Notes = append(result.Notes, fmt.Sprintf("builder bids failed for %s: %v", relay.Name, err))
-			continue
-		}
-
-		delivered, err := relay.fetchBidTraces(ctx, deliveredBidsPath, slot)
-		if err != nil {
-			result.Notes = append(result.Notes, fmt.Sprintf("delivered bids failed for %s: %v", relay.Name, err))
-		} else {
-			for _, trace := range delivered {
-				candidates = append(candidates, winnerCandidate{Relay: relay.Name, Trace: trace})
+		relay := relay
+		relayWG.Add(1)
+		go func() {
+			defer relayWG.Done()
+			bids, builderErr := relay.fetchBidTraces(ctx, builderBidsPath, slot)
+			delivered, deliveredErr := relay.fetchBidTraces(ctx, deliveredBidsPath, slot)
+			fetchesCh <- relaySlotFetch{
+				RelayName:    relay.Name,
+				Bids:         bids,
+				Delivered:    delivered,
+				BuilderErr:   builderErr,
+				DeliveredErr: deliveredErr,
 			}
+		}()
+	}
+	relayWG.Wait()
+	close(fetchesCh)
+
+	for fetch := range fetchesCh {
+		if fetch.BuilderErr != nil {
+			result.Notes = append(result.Notes, fmt.Sprintf("builder bids failed for %s: %v", fetch.RelayName, fetch.BuilderErr))
+		}
+		if fetch.DeliveredErr != nil {
+			result.Notes = append(result.Notes, fmt.Sprintf("delivered bids failed for %s: %v", fetch.RelayName, fetch.DeliveredErr))
 		}
 
-		for _, trace := range bids {
+		for _, trace := range fetch.Delivered {
+			candidates = append(candidates, winnerCandidate{Relay: fetch.RelayName, Trace: trace})
+		}
+
+		for _, trace := range fetch.Bids {
 			valueETH, err := weiToETH(trace.Value.String())
 			if err != nil {
-				result.Notes = append(result.Notes, fmt.Sprintf("invalid value for relay %s block %s: %v", relay.Name, trace.BlockHash, err))
+				result.Notes = append(result.Notes, fmt.Sprintf("invalid value for relay %s block %s: %v", fetch.RelayName, trace.BlockHash, err))
 				continue
 			}
 
 			ts := trace.TimestampMS.Uint64()
 			result.Bids = append(result.Bids, BidSample{
 				Slot:        slot,
-				Relay:       relay.Name,
+				Relay:       fetch.RelayName,
 				BlockHash:   strings.TrimSpace(trace.BlockHash),
 				ValueWei:    trace.Value.String(),
 				ValueETH:    valueETH,
@@ -579,15 +611,19 @@ func analyzeSingleSlot(
 
 	result.TotalBids = len(result.Bids)
 
-	selected, note := chooseWinningCandidate(candidates, beaconBlockHash, allowInferred)
+	winningCandidates, rewardCandidate, note := chooseWinningCandidate(candidates, beaconBlockHash, allowInferred)
 	if note != "" {
 		result.Notes = append(result.Notes, note)
 	}
 
-	if selected != nil {
-		result.WinningRelay = selected.Relay
-		result.WinningBlockHash = strings.TrimSpace(selected.Trace.BlockHash)
-		valueETH, err := weiToETH(selected.Trace.Value.String())
+	if len(winningCandidates) > 0 {
+		result.WinningRelays = uniqueRelayNames(winningCandidates)
+		result.WinningRelay = strings.Join(result.WinningRelays, ",")
+	}
+
+	if rewardCandidate != nil {
+		result.WinningBlockHash = strings.TrimSpace(rewardCandidate.Trace.BlockHash)
+		valueETH, err := weiToETH(rewardCandidate.Trace.Value.String())
 		if err == nil {
 			result.WinningValueETH = valueETH
 			result.WinningValueKnown = true
@@ -595,62 +631,69 @@ func analyzeSingleSlot(
 			result.Notes = append(result.Notes, "winning value parse error: "+err.Error())
 		}
 
-		if selected.Trace.TimestampMS.Uint64() > 0 {
-			ms := int64(selected.Trace.TimestampMS.Uint64()) - slotStartMS
+		if rewardCandidate.Trace.TimestampMS.Uint64() > 0 {
+			ms := int64(rewardCandidate.Trace.TimestampMS.Uint64()) - slotStartMS
 			result.WinningMSInto = &ms
 		}
 	}
 
-	matchingDeliveredToCanonical := 0
-	if result.BeaconBlockHash != "" {
-		matchingDeliveredToCanonical = countMatchingCandidatesByBlockHash(candidates, result.BeaconBlockHash)
-	}
-
-	if selected == nil && hasBeaconBlock && result.BeaconBlockHash != "" && matchingDeliveredToCanonical == 0 {
+	if len(winningCandidates) == 0 && hasBeaconBlock && result.BeaconBlockHash != "" {
 		result.WinningRelay = "self-built"
+		result.WinningRelays = []string{"self-built"}
 		result.WinningBlockHash = result.BeaconBlockHash
 		result.Notes = append(result.Notes, "canonical block not found in relay delivered traces; attributed as self-built")
+
+		rewardETH, ok, rewardErr := fetchBeaconBlockRewardETH(ctx, httpClient, beaconEndpoint, slot, retryPolicy)
+		if rewardErr != nil {
+			result.Notes = append(result.Notes, "self-built reward lookup failed: "+rewardErr.Error())
+		} else if ok {
+			result.WinningValueETH = rewardETH
+			result.WinningValueKnown = true
+			result.Notes = append(result.Notes, "self-built reward sourced from beacon block rewards endpoint")
+		}
 	}
 
-	for i := range result.Bids {
-		if result.WinningRelay == "" {
-			break
+	if len(result.WinningRelays) > 0 && !(len(result.WinningRelays) == 1 && result.WinningRelays[0] == "self-built") {
+		winningRelaySet := make(map[string]struct{}, len(result.WinningRelays))
+		for _, relay := range result.WinningRelays {
+			winningRelaySet[strings.ToLower(relay)] = struct{}{}
 		}
 
-		if !strings.EqualFold(result.Bids[i].Relay, result.WinningRelay) {
-			continue
-		}
-		if result.WinningBlockHash != "" && !strings.EqualFold(result.Bids[i].BlockHash, result.WinningBlockHash) {
-			continue
-		}
+		for i := range result.Bids {
+			if _, ok := winningRelaySet[strings.ToLower(result.Bids[i].Relay)]; !ok {
+				continue
+			}
+			if result.WinningBlockHash != "" && !strings.EqualFold(result.Bids[i].BlockHash, result.WinningBlockHash) {
+				continue
+			}
 
-		result.Bids[i].IsWinningBid = true
-		if result.WinningMSInto == nil {
-			ms := result.Bids[i].MSIntoSlot
-			result.WinningMSInto = &ms
+			result.Bids[i].IsWinningBid = true
+			if result.WinningMSInto == nil {
+				ms := result.Bids[i].MSIntoSlot
+				result.WinningMSInto = &ms
+			}
 		}
-		break
 	}
 
-	if hasBeaconBlock && result.WinningRelay == "" && matchingDeliveredToCanonical == 0 {
+	if hasBeaconBlock && result.WinningRelay == "" {
 		result.Notes = append(result.Notes, "no relay candidate matched this canonical beacon block")
 	}
 
 	return result
 }
 
-func chooseWinningCandidate(candidates []winnerCandidate, beaconBlockHash string, allowInferred bool) (*winnerCandidate, string) {
+func chooseWinningCandidate(candidates []winnerCandidate, beaconBlockHash string, allowInferred bool) ([]winnerCandidate, *winnerCandidate, string) {
 	if len(candidates) == 0 {
-		return nil, ""
+		return nil, nil, ""
 	}
 
 	beaconBlockHash = strings.TrimSpace(beaconBlockHash)
 	if beaconBlockHash == "" {
 		if allowInferred {
 			selected := highestValueCandidate(candidates)
-			return &selected, "inferred winner: beacon block hash unavailable; selected highest value delivered trace"
+			return []winnerCandidate{selected}, &selected, "inferred winner: beacon block hash unavailable; selected highest value delivered trace"
 		}
-		return nil, "beacon block hash unavailable; winner relay cannot be attributed safely"
+		return nil, nil, "beacon block hash unavailable; winner relay cannot be attributed safely"
 	}
 
 	matching := make([]winnerCandidate, 0, len(candidates))
@@ -662,34 +705,36 @@ func chooseWinningCandidate(candidates []winnerCandidate, beaconBlockHash string
 
 	if len(matching) == 1 {
 		selected := matching[0]
-		return &selected, ""
+		return matching, &selected, ""
 	}
 
 	if len(matching) > 1 {
-		if allowInferred {
-			selected := highestValueCandidate(matching)
-			return &selected, "inferred winner: multiple relays delivered canonical block hash; selected highest value trace"
-		}
-		return nil, "multiple relays delivered the canonical block hash; winner relay attribution is ambiguous"
+		selected := highestValueCandidate(matching)
+		return matching, &selected, "multiple relays delivered canonical block hash; tracking all matching relays and using highest value trace for reward"
 	}
 
-	return nil, "no relay delivered trace matched the canonical beacon block hash"
+	return nil, nil, "no relay delivered trace matched the canonical beacon block hash"
 }
 
-func countMatchingCandidatesByBlockHash(candidates []winnerCandidate, blockHash string) int {
-	blockHash = strings.TrimSpace(blockHash)
-	if blockHash == "" {
-		return 0
-	}
+func uniqueRelayNames(candidates []winnerCandidate) []string {
+	seen := map[string]bool{}
+	names := make([]string, 0, len(candidates))
 
-	count := 0
 	for _, candidate := range candidates {
-		if strings.EqualFold(strings.TrimSpace(candidate.Trace.BlockHash), blockHash) {
-			count++
+		name := strings.TrimSpace(candidate.Relay)
+		if name == "" {
+			continue
 		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		names = append(names, name)
 	}
 
-	return count
+	sort.Strings(names)
+	return names
 }
 
 func highestValueCandidate(candidates []winnerCandidate) winnerCandidate {
@@ -736,6 +781,67 @@ func weiToETH(raw string) (float64, error) {
 	return result, nil
 }
 
+func gweiToETH(raw string) (float64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, errors.New("empty gwei value")
+	}
+
+	value := new(big.Int)
+	if _, ok := value.SetString(raw, 10); !ok {
+		return 0, fmt.Errorf("invalid gwei value %q", raw)
+	}
+
+	f := new(big.Float).SetInt(value)
+	eth := new(big.Float).Quo(f, gweiPerETH)
+	result, _ := eth.Float64()
+	return result, nil
+}
+
+func fetchBeaconBlockRewardETH(
+	ctx context.Context,
+	httpClient *http.Client,
+	beaconEndpoint string,
+	slot uint64,
+	retryPolicy RetryPolicy,
+) (float64, bool, error) {
+	endpoint := fmt.Sprintf("%s/eth/v1/beacon/rewards/blocks/%d", strings.TrimRight(beaconEndpoint, "/"), slot)
+	resp, err := getWithRetry(ctx, httpClient, endpoint, retryPolicy)
+	if err != nil {
+		return 0, false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return 0, false, nil
+	}
+
+	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented {
+		return 0, false, nil
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return 0, false, fmt.Errorf("status %d from %s: %s", resp.StatusCode, endpoint, strings.TrimSpace(string(body)))
+	}
+
+	out := beaconBlockRewardResponse{}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, false, err
+	}
+
+	if strings.TrimSpace(out.Data.Total.String()) == "" {
+		return 0, false, nil
+	}
+
+	rewardETH, err := gweiToETH(out.Data.Total.String())
+	if err != nil {
+		return 0, false, err
+	}
+
+	return rewardETH, true, nil
+}
+
 func fetchBeaconExecutionBlockHash(
 	ctx context.Context,
 	httpClient *http.Client,
@@ -744,32 +850,73 @@ func fetchBeaconExecutionBlockHash(
 	retryPolicy RetryPolicy,
 ) (string, bool, error) {
 	endpoint := fmt.Sprintf("%s/eth/v2/beacon/blocks/%d", strings.TrimRight(beaconEndpoint, "/"), slot)
-	resp, err := getWithRetry(ctx, httpClient, endpoint, retryPolicy)
-	if err != nil {
-		return "", false, err
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 0; attempt <= retryPolicy.MaxRetries; attempt++ {
+		resp, err := getWithRetry(ctx, httpClient, endpoint, RetryPolicy{
+			MaxRetries:  0,
+			BaseBackoff: retryPolicy.BaseBackoff,
+		})
+		if err != nil {
+			lastErr = err
+			if attempt < retryPolicy.MaxRetries && isRetryableRequestErr(err) {
+				if sleepErr := sleepForRetry(ctx, retryDelay(attempt, retryPolicy.BaseBackoff)); sleepErr != nil {
+					return "", false, sleepErr
+				}
+				continue
+			}
+			return "", false, err
+		}
 
-	if resp.StatusCode == http.StatusNotFound {
-		return "", false, nil
+		if resp.StatusCode == http.StatusNotFound {
+			_ = resp.Body.Close()
+			return "", false, nil
+		}
+
+		if isRetryableHTTPStatus(resp.StatusCode) && attempt < retryPolicy.MaxRetries {
+			retryDelayHint := retryDelay(attempt, retryPolicy.BaseBackoff)
+			if hinted, ok := retryAfterDelay(resp.Header.Get("Retry-After")); ok {
+				retryDelayHint = hinted
+			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2048))
+			_ = resp.Body.Close()
+			if sleepErr := sleepForRetry(ctx, retryDelayHint); sleepErr != nil {
+				return "", false, sleepErr
+			}
+			continue
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+			_ = resp.Body.Close()
+			return "", false, fmt.Errorf("beacon response status %d from %s: %s", resp.StatusCode, endpoint, strings.TrimSpace(string(body)))
+		}
+
+		out := beaconBlockResponse{}
+		err = json.NewDecoder(resp.Body).Decode(&out)
+		_ = resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			if attempt < retryPolicy.MaxRetries && isRetryableReadOrDecodeErr(err) {
+				if sleepErr := sleepForRetry(ctx, retryDelay(attempt, retryPolicy.BaseBackoff)); sleepErr != nil {
+					return "", false, sleepErr
+				}
+				continue
+			}
+			return "", false, err
+		}
+
+		blockHash := strings.TrimSpace(out.Data.Message.Body.ExecutionPayload.BlockHash)
+		if blockHash == "" {
+			blockHash = strings.TrimSpace(out.Data.Message.Body.ExecutionPayloadHeader.BlockHash)
+		}
+
+		return blockHash, true, nil
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return "", false, fmt.Errorf("beacon response status %d from %s: %s", resp.StatusCode, endpoint, strings.TrimSpace(string(body)))
+	if lastErr != nil {
+		return "", false, lastErr
 	}
-
-	out := beaconBlockResponse{}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", false, err
-	}
-
-	blockHash := strings.TrimSpace(out.Data.Message.Body.ExecutionPayload.BlockHash)
-	if blockHash == "" {
-		blockHash = strings.TrimSpace(out.Data.Message.Body.ExecutionPayloadHeader.BlockHash)
-	}
-
-	return blockHash, true, nil
+	return "", false, fmt.Errorf("beacon block fetch failed for %s", endpoint)
 }
 
 func (r RelayClient) fetchBidTraces(ctx context.Context, path string, slot uint64) ([]BidTrace, error) {
@@ -882,6 +1029,19 @@ func isRetryableRequestErr(err error) bool {
 	return false
 }
 
+func isRetryableReadOrDecodeErr(err error) bool {
+	if isRetryableRequestErr(err) {
+		return true
+	}
+
+	// Often surfaced when timeout/cancellation interrupts response body reads.
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+
+	return false
+}
+
 func retryDelay(attempt int, base time.Duration) time.Duration {
 	if base <= 0 {
 		base = 300 * time.Millisecond
@@ -933,7 +1093,7 @@ func sleepForRetry(ctx context.Context, d time.Duration) error {
 func printSlotSummary(results []SlotAnalysis) {
 	fmt.Println("=== Slot Winner Summary ===")
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "SLOT\tBEACON_BLOCK_HASH\tWINNING_RELAY\tWINNING_BID_ETH\tWIN_BID_MS_INTO_SLOT\tBID_COUNT\tNOTES")
+	fmt.Fprintln(w, "SLOT\tBEACON_BLOCK_HASH\tWINNING_RELAYS\tWINNING_BID_ETH\tWIN_BID_MS_INTO_SLOT\tBID_COUNT\tNOTES")
 
 	for _, r := range results {
 		winningETH := "-"
