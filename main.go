@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,21 +29,24 @@ const (
 
 var weiPerETH = new(big.Float).SetInt(big.NewInt(1_000_000_000_000_000_000))
 var gweiPerETH = new(big.Float).SetInt(big.NewInt(1_000_000_000))
+var waitForSecondsPattern = regexp.MustCompile(`(?i)wait\s+for\s+([0-9]+)\s*s`)
 
 type Config struct {
-	BeaconEndpoint string
-	RelayArg       string
-	StartSlotArg   string
-	EndSlotArg     string
-	StartTimeArg   string
-	EndTimeArg     string
-	Concurrency    int
-	HTTPTimeout    time.Duration
-	BucketMS       int64
-	PrintAllBids   bool
-	AllowInferred  bool
-	MaxRetries     int
-	RetryBackoff   time.Duration
+	BeaconEndpoint   string
+	RelayArg         string
+	StartSlotArg     string
+	EndSlotArg       string
+	StartTimeArg     string
+	EndTimeArg       string
+	Concurrency      int
+	RelayConcurrency int
+	HTTPTimeout      time.Duration
+	BucketMS         int64
+	AllRelayBids     bool
+	PrintAllBids     bool
+	AllowInferred    bool
+	MaxRetries       int
+	RetryBackoff     time.Duration
 }
 
 type RetryPolicy struct {
@@ -84,6 +88,7 @@ type BidSample struct {
 	ValueETH     float64
 	TimestampMS  uint64
 	MSIntoSlot   int64
+	HasTimestamp bool
 	IsWinningBid bool
 }
 
@@ -228,8 +233,10 @@ func parseFlags() Config {
 	flag.StringVar(&cfg.StartTimeArg, "start-time", "", "Start time (RFC3339 or unix seconds/millis)")
 	flag.StringVar(&cfg.EndTimeArg, "end-time", "", "End time (RFC3339 or unix seconds/millis)")
 	flag.IntVar(&cfg.Concurrency, "concurrency", 8, "Number of slots analyzed in parallel")
+	flag.IntVar(&cfg.RelayConcurrency, "relay-concurrency", 4, "Number of per-slot relay requests in parallel")
 	flag.DurationVar(&cfg.HTTPTimeout, "http-timeout", 10*time.Second, "HTTP timeout per request")
 	flag.Int64Var(&cfg.BucketMS, "bucket-ms", 100, "Bucket size in milliseconds for lateness stats")
+	flag.BoolVar(&cfg.AllRelayBids, "all-relay-bids", false, "Collect all relay bids (default: only winning bids)")
 	flag.BoolVar(&cfg.PrintAllBids, "print-bids", false, "Print every bid row in addition to summary tables")
 	flag.BoolVar(&cfg.AllowInferred, "allow-inferred-winner", false, "Allow inferred winner attribution when canonical matching is unavailable")
 	flag.IntVar(&cfg.MaxRetries, "max-retries", 3, "Max retries for timeout/rate-limit/server errors")
@@ -248,6 +255,9 @@ func run(cfg Config) error {
 	}
 	if cfg.Concurrency <= 0 {
 		return errors.New("-concurrency must be >= 1")
+	}
+	if cfg.RelayConcurrency <= 0 {
+		return errors.New("-relay-concurrency must be >= 1")
 	}
 	if cfg.BucketMS <= 0 {
 		return errors.New("-bucket-ms must be >= 1")
@@ -298,6 +308,8 @@ func run(cfg Config) error {
 		startSlot,
 		endSlot,
 		cfg.Concurrency,
+		cfg.RelayConcurrency,
+		cfg.AllRelayBids,
 		cfg.AllowInferred,
 		retryPolicy,
 	)
@@ -305,7 +317,7 @@ func run(cfg Config) error {
 
 	printSlotSummary(results)
 	fmt.Println()
-	printLatenessStats(results, cfg.BucketMS)
+	printLatenessStats(results, cfg.BucketMS, cfg.AllRelayBids)
 
 	if cfg.PrintAllBids {
 		fmt.Println()
@@ -494,6 +506,8 @@ func analyzeSlotRange(
 	startSlot uint64,
 	endSlot uint64,
 	concurrency int,
+	relayConcurrency int,
+	allRelayBids bool,
 	allowInferred bool,
 	retryPolicy RetryPolicy,
 ) []SlotAnalysis {
@@ -513,7 +527,7 @@ func analyzeSlotRange(
 		go func() {
 			defer wg.Done()
 			for slot := range jobs {
-				resultsCh <- analyzeSingleSlot(ctx, httpClient, beaconEndpoint, relays, spec, slot, allowInferred, retryPolicy)
+				resultsCh <- analyzeSingleSlot(ctx, httpClient, beaconEndpoint, relays, spec, slot, relayConcurrency, allRelayBids, allowInferred, retryPolicy)
 			}
 		}()
 	}
@@ -541,6 +555,8 @@ func analyzeSingleSlot(
 	relays []RelayClient,
 	spec ChainSpec,
 	slot uint64,
+	relayConcurrency int,
+	allRelayBids bool,
 	allowInferred bool,
 	retryPolicy RetryPolicy,
 ) SlotAnalysis {
@@ -556,14 +572,26 @@ func analyzeSingleSlot(
 	}
 
 	candidates := make([]winnerCandidate, 0, len(relays))
+	relayByName := make(map[string]RelayClient, len(relays))
+	for _, relay := range relays {
+		relayByName[strings.ToLower(strings.TrimSpace(relay.Name))] = relay
+	}
 	fetchesCh := make(chan relaySlotFetch, len(relays))
 	var relayWG sync.WaitGroup
+	relaySem := make(chan struct{}, relayConcurrency)
 	for _, relay := range relays {
 		relay := relay
 		relayWG.Add(1)
 		go func() {
 			defer relayWG.Done()
-			bids, builderErr := relay.fetchBidTraces(ctx, builderBidsPath, slot)
+			relaySem <- struct{}{}
+			defer func() { <-relaySem }()
+
+			var bids []BidTrace
+			var builderErr error
+			if allRelayBids {
+				bids, builderErr = relay.fetchBidTraces(ctx, builderBidsPath, slot)
+			}
 			delivered, deliveredErr := relay.fetchBidTraces(ctx, deliveredBidsPath, slot)
 			fetchesCh <- relaySlotFetch{
 				RelayName:    relay.Name,
@@ -578,7 +606,7 @@ func analyzeSingleSlot(
 	close(fetchesCh)
 
 	for fetch := range fetchesCh {
-		if fetch.BuilderErr != nil {
+		if allRelayBids && fetch.BuilderErr != nil {
 			result.Notes = append(result.Notes, fmt.Sprintf("builder bids failed for %s: %v", fetch.RelayName, fetch.BuilderErr))
 		}
 		if fetch.DeliveredErr != nil {
@@ -589,27 +617,29 @@ func analyzeSingleSlot(
 			candidates = append(candidates, winnerCandidate{Relay: fetch.RelayName, Trace: trace})
 		}
 
-		for _, trace := range fetch.Bids {
-			valueETH, err := weiToETH(trace.Value.String())
-			if err != nil {
-				result.Notes = append(result.Notes, fmt.Sprintf("invalid value for relay %s block %s: %v", fetch.RelayName, trace.BlockHash, err))
-				continue
-			}
+		if allRelayBids {
+			for _, trace := range fetch.Bids {
+				valueETH, err := weiToETH(trace.Value.String())
+				if err != nil {
+					result.Notes = append(result.Notes, fmt.Sprintf("invalid value for relay %s block %s: %v", fetch.RelayName, trace.BlockHash, err))
+					continue
+				}
 
-			ts := trace.TimestampMS.Uint64()
-			result.Bids = append(result.Bids, BidSample{
-				Slot:        slot,
-				Relay:       fetch.RelayName,
-				BlockHash:   strings.TrimSpace(trace.BlockHash),
-				ValueWei:    trace.Value.String(),
-				ValueETH:    valueETH,
-				TimestampMS: ts,
-				MSIntoSlot:  int64(ts) - slotStartMS,
-			})
+				ts := trace.TimestampMS.Uint64()
+				msIntoSlot, hasTimestamp := normalizeMSIntoSlot(ts, slotStartMS)
+				result.Bids = append(result.Bids, BidSample{
+					Slot:         slot,
+					Relay:        fetch.RelayName,
+					BlockHash:    strings.TrimSpace(trace.BlockHash),
+					ValueWei:     trace.Value.String(),
+					ValueETH:     valueETH,
+					TimestampMS:  ts,
+					MSIntoSlot:   msIntoSlot,
+					HasTimestamp: hasTimestamp,
+				})
+			}
 		}
 	}
-
-	result.TotalBids = len(result.Bids)
 
 	winningCandidates, rewardCandidate, note := chooseWinningCandidate(candidates, beaconBlockHash, allowInferred)
 	if note != "" {
@@ -668,7 +698,7 @@ func analyzeSingleSlot(
 			}
 
 			result.Bids[i].IsWinningBid = true
-			if result.WinningMSInto == nil {
+			if result.WinningMSInto == nil && result.Bids[i].HasTimestamp {
 				ms := result.Bids[i].MSIntoSlot
 				result.WinningMSInto = &ms
 			}
@@ -678,6 +708,24 @@ func analyzeSingleSlot(
 	if hasBeaconBlock && result.WinningRelay == "" {
 		result.Notes = append(result.Notes, "no relay candidate matched this canonical beacon block")
 	}
+
+	if !allRelayBids {
+		result.Bids = fetchWinningBidSamplesFromBuilder(
+			ctx,
+			slot,
+			slotStartMS,
+			result.WinningBlockHash,
+			winningCandidates,
+			relayByName,
+			relayConcurrency,
+			&result,
+		)
+		if len(result.Bids) == 0 {
+			// Fallback to delivered traces if builder bid timestamps are unavailable.
+			result.Bids = winningCandidatesToBidSamples(winningCandidates, slot, slotStartMS, &result)
+		}
+	}
+	result.TotalBids = len(result.Bids)
 
 	return result
 }
@@ -735,6 +783,210 @@ func uniqueRelayNames(candidates []winnerCandidate) []string {
 
 	sort.Strings(names)
 	return names
+}
+
+func winningCandidatesToBidSamples(candidates []winnerCandidate, slot uint64, slotStartMS int64, result *SlotAnalysis) []BidSample {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	seen := map[string]bool{}
+	out := make([]BidSample, 0, len(candidates))
+	for _, candidate := range candidates {
+		blockHash := strings.TrimSpace(candidate.Trace.BlockHash)
+		valueWei := candidate.Trace.Value.String()
+		ts := candidate.Trace.TimestampMS.Uint64()
+		key := strings.ToLower(candidate.Relay) + "|" + strings.ToLower(blockHash) + "|" + strconv.FormatUint(ts, 10) + "|" + valueWei
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		valueETH, err := weiToETH(valueWei)
+		if err != nil {
+			result.Notes = append(result.Notes, fmt.Sprintf("invalid winning value for relay %s block %s: %v", candidate.Relay, blockHash, err))
+			continue
+		}
+		msIntoSlot, hasTimestamp := normalizeMSIntoSlot(ts, slotStartMS)
+
+		out = append(out, BidSample{
+			Slot:         slot,
+			Relay:        candidate.Relay,
+			BlockHash:    blockHash,
+			ValueWei:     valueWei,
+			ValueETH:     valueETH,
+			TimestampMS:  ts,
+			MSIntoSlot:   msIntoSlot,
+			HasTimestamp: hasTimestamp,
+			IsWinningBid: true,
+		})
+	}
+
+	return out
+}
+
+func fetchWinningBidSamplesFromBuilder(
+	ctx context.Context,
+	slot uint64,
+	slotStartMS int64,
+	winningBlockHash string,
+	winningCandidates []winnerCandidate,
+	relayByName map[string]RelayClient,
+	relayConcurrency int,
+	result *SlotAnalysis,
+) []BidSample {
+	type relayTarget struct {
+		RelayName string
+		BlockHash string
+	}
+	type fetchResult struct {
+		Target relayTarget
+		Traces []BidTrace
+		Err    error
+	}
+
+	targetsByKey := map[string]relayTarget{}
+	for _, candidate := range winningCandidates {
+		relayName := strings.TrimSpace(candidate.Relay)
+		if relayName == "" {
+			continue
+		}
+
+		targetHash := strings.TrimSpace(winningBlockHash)
+		if targetHash == "" {
+			targetHash = strings.TrimSpace(candidate.Trace.BlockHash)
+		}
+
+		key := strings.ToLower(relayName)
+		if existing, ok := targetsByKey[key]; ok {
+			if existing.BlockHash == "" && targetHash != "" {
+				existing.BlockHash = targetHash
+				targetsByKey[key] = existing
+			}
+			continue
+		}
+
+		targetsByKey[key] = relayTarget{
+			RelayName: relayName,
+			BlockHash: targetHash,
+		}
+	}
+
+	if len(targetsByKey) == 0 {
+		return nil
+	}
+
+	targets := make([]relayTarget, 0, len(targetsByKey))
+	for _, t := range targetsByKey {
+		targets = append(targets, t)
+	}
+
+	resultsCh := make(chan fetchResult, len(targets))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, relayConcurrency)
+
+	for _, target := range targets {
+		target := target
+		relayClient, ok := relayByName[strings.ToLower(target.RelayName)]
+		if !ok {
+			result.Notes = append(result.Notes, fmt.Sprintf("winning relay %s missing from relay client map", target.RelayName))
+			continue
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			traces, err := relayClient.fetchBidTraces(ctx, builderBidsPath, slot)
+			resultsCh <- fetchResult{
+				Target: target,
+				Traces: traces,
+				Err:    err,
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(resultsCh)
+
+	out := make([]BidSample, 0, len(targets))
+	for fr := range resultsCh {
+		if fr.Err != nil {
+			result.Notes = append(result.Notes, fmt.Sprintf("builder bids failed for %s: %v", fr.Target.RelayName, fr.Err))
+			continue
+		}
+
+		filtered := make([]BidTrace, 0, len(fr.Traces))
+		for _, trace := range fr.Traces {
+			if fr.Target.BlockHash != "" && !strings.EqualFold(strings.TrimSpace(trace.BlockHash), fr.Target.BlockHash) {
+				continue
+			}
+			filtered = append(filtered, trace)
+		}
+		if len(filtered) == 0 {
+			continue
+		}
+
+		bestTrace, ok := highestValueTrace(filtered)
+		if !ok {
+			continue
+		}
+
+		valueWei := bestTrace.Value.String()
+		valueETH, err := weiToETH(valueWei)
+		if err != nil {
+			result.Notes = append(result.Notes, fmt.Sprintf("invalid winning value for relay %s block %s: %v", fr.Target.RelayName, bestTrace.BlockHash, err))
+			continue
+		}
+
+		ts := bestTrace.TimestampMS.Uint64()
+		msIntoSlot, hasTimestamp := normalizeMSIntoSlot(ts, slotStartMS)
+		out = append(out, BidSample{
+			Slot:         slot,
+			Relay:        fr.Target.RelayName,
+			BlockHash:    strings.TrimSpace(bestTrace.BlockHash),
+			ValueWei:     valueWei,
+			ValueETH:     valueETH,
+			TimestampMS:  ts,
+			MSIntoSlot:   msIntoSlot,
+			HasTimestamp: hasTimestamp,
+			IsWinningBid: true,
+		})
+	}
+
+	return out
+}
+
+func highestValueTrace(traces []BidTrace) (BidTrace, bool) {
+	if len(traces) == 0 {
+		return BidTrace{}, false
+	}
+
+	best := traces[0]
+	bestValue := parseWei(best.Value.String())
+	bestTS := best.TimestampMS.Uint64()
+
+	for i := 1; i < len(traces); i++ {
+		value := parseWei(traces[i].Value.String())
+		ts := traces[i].TimestampMS.Uint64()
+		cmp := value.Cmp(bestValue)
+		if cmp > 0 || (cmp == 0 && ts > bestTS) {
+			best = traces[i]
+			bestValue = value
+			bestTS = ts
+		}
+	}
+
+	return best, true
+}
+
+func normalizeMSIntoSlot(timestampMS uint64, slotStartMS int64) (int64, bool) {
+	if timestampMS == 0 {
+		return 0, false
+	}
+	return int64(timestampMS) - slotStartMS, true
 }
 
 func highestValueCandidate(candidates []winnerCandidate) winnerCandidate {
@@ -982,10 +1234,29 @@ func getWithRetry(ctx context.Context, httpClient *http.Client, endpoint string,
 		if isRetryableHTTPStatus(resp.StatusCode) && attempt < retryPolicy.MaxRetries {
 			retryDelayHint := retryDelay(attempt, retryPolicy.BaseBackoff)
 			if hinted, ok := retryAfterDelay(resp.Header.Get("Retry-After")); ok {
-				retryDelayHint = hinted
+				if hinted > retryDelayHint {
+					retryDelayHint = hinted
+				}
 			}
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2048))
+
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+			bodyText := strings.TrimSpace(string(bodyBytes))
+			if hinted, ok := retryAfterDelayFromBody(bodyText); ok {
+				if hinted > retryDelayHint {
+					retryDelayHint = hinted
+				}
+			}
 			_ = resp.Body.Close()
+
+			if resp.StatusCode == http.StatusTooManyRequests {
+				min429Delay := retryPolicy.BaseBackoff
+				if min429Delay < 500*time.Millisecond {
+					min429Delay = 500 * time.Millisecond
+				}
+				if retryDelayHint < min429Delay {
+					retryDelayHint = min429Delay
+				}
+			}
 
 			if sleepErr := sleepForRetry(ctx, retryDelayHint); sleepErr != nil {
 				return nil, sleepErr
@@ -1078,6 +1349,20 @@ func retryAfterDelay(retryAfterHeader string) (time.Duration, bool) {
 	return 0, false
 }
 
+func retryAfterDelayFromBody(bodyText string) (time.Duration, bool) {
+	matches := waitForSecondsPattern.FindStringSubmatch(bodyText)
+	if len(matches) != 2 {
+		return 0, false
+	}
+
+	sec, err := strconv.Atoi(matches[1])
+	if err != nil || sec < 0 {
+		return 0, false
+	}
+
+	return time.Duration(sec) * time.Second, true
+}
+
 func sleepForRetry(ctx context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -1137,15 +1422,20 @@ func printSlotSummary(results []SlotAnalysis) {
 	_ = w.Flush()
 }
 
-func printLatenessStats(results []SlotAnalysis, bucketMS int64) {
+func printLatenessStats(results []SlotAnalysis, bucketMS int64, allRelayBids bool) {
 	buckets := map[int64]*latenessAgg{}
 
 	totalCount := 0
 	totalETH := 0.0
 	totalWins := 0
+	skippedNoTimestamp := 0
 
 	for _, slotResult := range results {
 		for _, bid := range slotResult.Bids {
+			if !bid.HasTimestamp {
+				skippedNoTimestamp++
+				continue
+			}
 			key := bucketStart(bid.MSIntoSlot, bucketMS)
 			if _, ok := buckets[key]; !ok {
 				buckets[key] = &latenessAgg{}
@@ -1163,8 +1453,16 @@ func printLatenessStats(results []SlotAnalysis, bucketMS int64) {
 		}
 	}
 
-	fmt.Println("=== Lateness vs Reward (all bids) ===")
+	title := "=== Lateness vs Reward (winning bids only) ==="
+	if allRelayBids {
+		title = "=== Lateness vs Reward (all bids) ==="
+	}
+	fmt.Println(title)
 	if totalCount == 0 {
+		if skippedNoTimestamp > 0 {
+			fmt.Printf("No timestamped bids returned in selected range (skipped %d bids without timestamp_ms).\n", skippedNoTimestamp)
+			return
+		}
 		fmt.Println("No bids returned in selected range.")
 		return
 	}
@@ -1190,6 +1488,9 @@ func printLatenessStats(results []SlotAnalysis, bucketMS int64) {
 	fmt.Printf("\nTotal bids: %d\n", totalCount)
 	fmt.Printf("Overall avg reward (ETH): %.6f\n", overallAvg)
 	fmt.Printf("Winning bids captured in relay traces: %d\n", totalWins)
+	if skippedNoTimestamp > 0 {
+		fmt.Printf("Skipped bids without timestamp_ms: %d\n", skippedNoTimestamp)
+	}
 }
 
 func bucketStart(ms int64, bucketSize int64) int64 {
@@ -1226,15 +1527,21 @@ func printAllBids(results []SlotAnalysis) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 	fmt.Fprintln(w, "SLOT\tRELAY\tBLOCK_HASH\tVALUE_ETH\tTIMESTAMP_MS\tMS_INTO_SLOT\tWINNING_BID")
 	for _, row := range rows {
+		ts := strconv.FormatUint(row.Bid.TimestampMS, 10)
+		msInto := strconv.FormatInt(row.Bid.MSIntoSlot, 10)
+		if !row.Bid.HasTimestamp {
+			ts = "-"
+			msInto = "-"
+		}
 		fmt.Fprintf(
 			w,
-			"%d\t%s\t%s\t%.6f\t%d\t%d\t%t\n",
+			"%d\t%s\t%s\t%.6f\t%s\t%s\t%t\n",
 			row.Bid.Slot,
 			row.Bid.Relay,
 			row.Bid.BlockHash,
 			row.Bid.ValueETH,
-			row.Bid.TimestampMS,
-			row.Bid.MSIntoSlot,
+			ts,
+			msInto,
 			row.Bid.IsWinningBid,
 		)
 	}

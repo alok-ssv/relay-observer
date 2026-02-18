@@ -7,6 +7,9 @@ Query relay bid traces across a slot range (or time range), identify the winning
 - Resolves slots from:
   - `-start-slot` and `-end-slot`, or
   - `-start-time` and `-end-time` (RFC3339 or unix timestamp)
+- Collects bids in one of two modes:
+  - default: only winning relay bids per slot
+  - `-all-relay-bids`: all relay builder bids
 - Pulls bid traces from each relay:
   - `builder_blocks_received`
   - `proposer_payload_delivered`
@@ -60,6 +63,8 @@ Use time range instead of slot range:
 ## Options
 
 ```text
+-all-relay-bids
+    Collect all relay bids (default: only winning bids)
 -allow-inferred-winner
     Allow inferred winner attribution when canonical matching is unavailable
 -beacon-endpoint string
@@ -68,6 +73,8 @@ Use time range instead of slot range:
     Bucket size in milliseconds for lateness stats (default 100)
 -concurrency int
     Number of slots analyzed in parallel (default 8)
+-relay-concurrency int
+    Number of per-slot relay requests in parallel (default 4)
 -end-slot string
     End slot (inclusive)
 -end-time string
@@ -100,6 +107,14 @@ Use time range instead of slot range:
 - If `-allow-inferred-winner` is enabled:
   - when canonical matching is unavailable, winner can be inferred from highest delivered value trace.
 
+## Bid collection mode
+
+- Default mode (no `-all-relay-bids`):
+  - only winning bid(s) are kept per slot for bid table and lateness/reward stats.
+  - timing for those winning bids is sourced from relay `builder_blocks_received` for winning relay/block pairs (fallback to delivered traces if unavailable).
+- `-all-relay-bids` enabled:
+  - all relay builder bids are collected and used in bid table and lateness/reward stats.
+
 ## Retry behavior
 
 - Retries apply to beacon and relay API GET calls.
@@ -109,6 +124,7 @@ Use time range instead of slot range:
 - Backoff:
   - exponential using `-retry-backoff` as base
   - respects `Retry-After` header when present
+  - for `429` responses with body hints like `Wait for Ns`, that hint is also honored
 
 ## Notes
 
