@@ -75,6 +75,9 @@ type SlotAnalysis struct {
 	WinningValueETH   float64
 	WinningValueKnown bool
 	WinningMSInto     *int64
+	MaxBidETH         float64
+	MaxBidKnown       bool
+	MaxBidMSInto      *int64
 	TotalBids         int
 	Bids              []BidSample
 	Notes             []string
@@ -106,9 +109,13 @@ type relaySlotFetch struct {
 }
 
 type latenessAgg struct {
-	Count    int
-	TotalETH float64
-	WinCount int
+	Count           int
+	TotalETH        float64
+	WinCount        int
+	WinningTotalETH float64
+	MaxBidETH       float64
+	Slots           map[uint64]struct{}
+	WinningSlots    map[uint64]struct{}
 }
 
 type FlexString string
@@ -725,6 +732,35 @@ func analyzeSingleSlot(
 			result.Bids = winningCandidatesToBidSamples(winningCandidates, slot, slotStartMS, &result)
 		}
 	}
+
+	for _, bid := range result.Bids {
+		if !result.MaxBidKnown || bid.ValueETH > result.MaxBidETH {
+			result.MaxBidETH = bid.ValueETH
+			result.MaxBidKnown = true
+			result.MaxBidMSInto = nil
+			if bid.HasTimestamp {
+				ms := bid.MSIntoSlot
+				result.MaxBidMSInto = &ms
+			}
+			continue
+		}
+
+		if !result.MaxBidKnown || bid.ValueETH != result.MaxBidETH {
+			continue
+		}
+
+		if result.MaxBidMSInto == nil && bid.HasTimestamp {
+			ms := bid.MSIntoSlot
+			result.MaxBidMSInto = &ms
+			continue
+		}
+
+		if result.MaxBidMSInto != nil && bid.HasTimestamp && bid.MSIntoSlot < *result.MaxBidMSInto {
+			ms := bid.MSIntoSlot
+			result.MaxBidMSInto = &ms
+		}
+	}
+
 	result.TotalBids = len(result.Bids)
 
 	return result
@@ -1378,7 +1414,7 @@ func sleepForRetry(ctx context.Context, d time.Duration) error {
 func printSlotSummary(results []SlotAnalysis) {
 	fmt.Println("=== Slot Winner Summary ===")
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "SLOT\tBEACON_BLOCK_HASH\tWINNING_RELAYS\tWINNING_BID_ETH\tWIN_BID_MS_INTO_SLOT\tBID_COUNT\tNOTES")
+	fmt.Fprintln(w, "SLOT\tBEACON_BLOCK_HASH\tWINNING_RELAYS\tWINNING_BID_ETH\tWIN_BID_MS_INTO_SLOT\tMAX_BID_ETH\tMAX_BID_MS_INTO_SLOT\tBID_COUNT\tNOTES")
 
 	for _, r := range results {
 		winningETH := "-"
@@ -1389,6 +1425,16 @@ func printSlotSummary(results []SlotAnalysis) {
 		winningMS := "-"
 		if r.WinningMSInto != nil {
 			winningMS = strconv.FormatInt(*r.WinningMSInto, 10)
+		}
+
+		maxBidETH := "-"
+		if r.MaxBidKnown {
+			maxBidETH = fmt.Sprintf("%.6f", r.MaxBidETH)
+		}
+
+		maxBidMS := "-"
+		if r.MaxBidMSInto != nil {
+			maxBidMS = strconv.FormatInt(*r.MaxBidMSInto, 10)
 		}
 
 		blockHash := r.BeaconBlockHash
@@ -1408,12 +1454,14 @@ func printSlotSummary(results []SlotAnalysis) {
 
 		fmt.Fprintf(
 			w,
-			"%d\t%s\t%s\t%s\t%s\t%d\t%s\n",
+			"%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 			r.Slot,
 			blockHash,
 			winner,
 			winningETH,
 			winningMS,
+			maxBidETH,
+			maxBidMS,
 			r.TotalBids,
 			notes,
 		)
@@ -1438,13 +1486,22 @@ func printLatenessStats(results []SlotAnalysis, bucketMS int64, allRelayBids boo
 			}
 			key := bucketStart(bid.MSIntoSlot, bucketMS)
 			if _, ok := buckets[key]; !ok {
-				buckets[key] = &latenessAgg{}
+				buckets[key] = &latenessAgg{
+					Slots:        map[uint64]struct{}{},
+					WinningSlots: map[uint64]struct{}{},
+				}
 			}
 
 			buckets[key].Count++
 			buckets[key].TotalETH += bid.ValueETH
+			buckets[key].Slots[bid.Slot] = struct{}{}
+			if buckets[key].Count == 1 || bid.ValueETH > buckets[key].MaxBidETH {
+				buckets[key].MaxBidETH = bid.ValueETH
+			}
 			if bid.IsWinningBid {
 				buckets[key].WinCount++
+				buckets[key].WinningTotalETH += bid.ValueETH
+				buckets[key].WinningSlots[bid.Slot] = struct{}{}
 				totalWins++
 			}
 
@@ -1474,13 +1531,22 @@ func printLatenessStats(results []SlotAnalysis, bucketMS int64, allRelayBids boo
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "BUCKET_MS_FROM_SLOT_START\tBID_COUNT\tAVG_REWARD_ETH\tWIN_COUNT\tWIN_RATE")
+	fmt.Fprintln(w, "BUCKET_MS_FROM_SLOT_START\tBID_COUNT\tSLOT_COUNT\tAVG_REWARD_ETH\tMEAN_BID_ETH\tMAX_BID_ETH\tWIN_SLOT_COUNT\tWIN_RATE")
 	for _, k := range keys {
 		agg := buckets[k]
-		avg := agg.TotalETH / float64(agg.Count)
-		winRate := 100.0 * float64(agg.WinCount) / float64(agg.Count)
+		slotCount := len(agg.Slots)
+		winSlotCount := len(agg.WinningSlots)
+		avgReward := "-"
+		if agg.WinCount > 0 {
+			avgReward = fmt.Sprintf("%.6f", agg.WinningTotalETH/float64(agg.WinCount))
+		}
+		meanBid := agg.TotalETH / float64(agg.Count)
+		winRate := 0.0
+		if slotCount > 0 {
+			winRate = 100.0 * float64(winSlotCount) / float64(slotCount)
+		}
 		label := fmt.Sprintf("[%d,%d)", k, k+bucketMS)
-		fmt.Fprintf(w, "%s\t%d\t%.6f\t%d\t%.2f%%\n", label, agg.Count, avg, agg.WinCount, winRate)
+		fmt.Fprintf(w, "%s\t%d\t%d\t%s\t%.6f\t%.6f\t%d\t%.2f%%\n", label, agg.Count, slotCount, avgReward, meanBid, agg.MaxBidETH, winSlotCount, winRate)
 	}
 	_ = w.Flush()
 
