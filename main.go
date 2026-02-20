@@ -45,6 +45,7 @@ type Config struct {
 	AllRelayBids     bool
 	PrintAllBids     bool
 	AllowInferred    bool
+	EthGasPoolAddr   string
 	MaxRetries       int
 	RetryBackoff     time.Duration
 }
@@ -62,25 +63,29 @@ type ChainSpec struct {
 type RelayClient struct {
 	Name       string
 	BaseURL    string
+	IsETHGas   bool
 	HTTPClient *http.Client
 	Retry      RetryPolicy
 }
 
 type SlotAnalysis struct {
-	Slot              uint64
-	BeaconBlockHash   string
-	WinningRelay      string
-	WinningRelays     []string
-	WinningBlockHash  string
-	WinningValueETH   float64
-	WinningValueKnown bool
-	WinningMSInto     *int64
-	MaxBidETH         float64
-	MaxBidKnown       bool
-	MaxBidMSInto      *int64
-	TotalBids         int
-	Bids              []BidSample
-	Notes             []string
+	Slot               uint64
+	HasBeaconBlock     bool
+	BeaconBlockHash    string
+	BeaconFeeRecipient string
+	ETHGasMode         string
+	WinningRelay       string
+	WinningRelays      []string
+	WinningBlockHash   string
+	WinningValueETH    float64
+	WinningValueKnown  bool
+	WinningMSInto      *int64
+	MaxBidETH          float64
+	MaxBidKnown        bool
+	MaxBidMSInto       *int64
+	TotalBids          int
+	Bids               []BidSample
+	Notes              []string
 }
 
 type BidSample struct {
@@ -206,10 +211,12 @@ type beaconBlockResponse struct {
 		Message struct {
 			Body struct {
 				ExecutionPayload struct {
-					BlockHash string `json:"block_hash"`
+					BlockHash    string `json:"block_hash"`
+					FeeRecipient string `json:"fee_recipient"`
 				} `json:"execution_payload"`
 				ExecutionPayloadHeader struct {
-					BlockHash string `json:"block_hash"`
+					BlockHash    string `json:"block_hash"`
+					FeeRecipient string `json:"fee_recipient"`
 				} `json:"execution_payload_header"`
 			} `json:"body"`
 		} `json:"message"`
@@ -246,6 +253,7 @@ func parseFlags() Config {
 	flag.BoolVar(&cfg.AllRelayBids, "all-relay-bids", false, "Collect all relay bids (default: only winning bids)")
 	flag.BoolVar(&cfg.PrintAllBids, "print-bids", false, "Print every bid row in addition to summary tables")
 	flag.BoolVar(&cfg.AllowInferred, "allow-inferred-winner", false, "Allow inferred winner attribution when canonical matching is unavailable")
+	flag.StringVar(&cfg.EthGasPoolAddr, "ethgas-pool-address", "", "EthGasPool fee recipient address (0x...) used to classify ETHGasExternal blocks")
 	flag.IntVar(&cfg.MaxRetries, "max-retries", 3, "Max retries for timeout/rate-limit/server errors")
 	flag.DurationVar(&cfg.RetryBackoff, "retry-backoff", 300*time.Millisecond, "Base exponential backoff for retries")
 	flag.Parse()
@@ -274,6 +282,10 @@ func run(cfg Config) error {
 	}
 	if cfg.RetryBackoff <= 0 {
 		return errors.New("-retry-backoff must be > 0")
+	}
+	normalizedEthGasPoolAddr, err := normalizeAddress(cfg.EthGasPoolAddr)
+	if err != nil {
+		return fmt.Errorf("invalid -ethgas-pool-address: %w", err)
 	}
 
 	httpClient := &http.Client{Timeout: cfg.HTTPTimeout}
@@ -321,6 +333,7 @@ func run(cfg Config) error {
 		retryPolicy,
 	)
 	sort.Slice(results, func(i, j int) bool { return results[i].Slot < results[j].Slot })
+	tagETHGasModes(results, buildETHGasRelaySet(relays), normalizedEthGasPoolAddr)
 
 	printSlotSummary(results)
 	fmt.Println()
@@ -330,6 +343,12 @@ func run(cfg Config) error {
 		fmt.Println()
 		printAllBids(results)
 	}
+
+	fmt.Println()
+	printETHGasModeStats(results, normalizedEthGasPoolAddr)
+
+	fmt.Println()
+	printPerRelayBidStats(results)
 
 	return nil
 }
@@ -375,6 +394,7 @@ func parseRelays(arg string, httpClient *http.Client, retryPolicy RetryPolicy) (
 		relays = append(relays, RelayClient{
 			Name:       name,
 			BaseURL:    baseURL,
+			IsETHGas:   isETHGasRelayName(name) || isETHGasRelayName(baseURL),
 			HTTPClient: httpClient,
 			Retry:      retryPolicy,
 		})
@@ -570,12 +590,14 @@ func analyzeSingleSlot(
 	result := SlotAnalysis{Slot: slot}
 	slotStartMS := spec.GenesisTime.UnixMilli() + int64(slot)*int64(spec.SecondsPerSlot)*1000
 
-	beaconBlockHash, hasBeaconBlock, err := fetchBeaconExecutionBlockHash(ctx, httpClient, beaconEndpoint, slot, retryPolicy)
+	beaconBlockHash, beaconFeeRecipient, hasBeaconBlock, err := fetchBeaconExecutionInfo(ctx, httpClient, beaconEndpoint, slot, retryPolicy)
 	if err != nil {
 		result.Notes = append(result.Notes, "beacon block lookup failed: "+err.Error())
 	}
 	if hasBeaconBlock {
+		result.HasBeaconBlock = true
 		result.BeaconBlockHash = beaconBlockHash
+		result.BeaconFeeRecipient = beaconFeeRecipient
 	}
 
 	candidates := make([]winnerCandidate, 0, len(relays))
@@ -1130,13 +1152,13 @@ func fetchBeaconBlockRewardETH(
 	return rewardETH, true, nil
 }
 
-func fetchBeaconExecutionBlockHash(
+func fetchBeaconExecutionInfo(
 	ctx context.Context,
 	httpClient *http.Client,
 	beaconEndpoint string,
 	slot uint64,
 	retryPolicy RetryPolicy,
-) (string, bool, error) {
+) (string, string, bool, error) {
 	endpoint := fmt.Sprintf("%s/eth/v2/beacon/blocks/%d", strings.TrimRight(beaconEndpoint, "/"), slot)
 	var lastErr error
 	for attempt := 0; attempt <= retryPolicy.MaxRetries; attempt++ {
@@ -1148,16 +1170,16 @@ func fetchBeaconExecutionBlockHash(
 			lastErr = err
 			if attempt < retryPolicy.MaxRetries && isRetryableRequestErr(err) {
 				if sleepErr := sleepForRetry(ctx, retryDelay(attempt, retryPolicy.BaseBackoff)); sleepErr != nil {
-					return "", false, sleepErr
+					return "", "", false, sleepErr
 				}
 				continue
 			}
-			return "", false, err
+			return "", "", false, err
 		}
 
 		if resp.StatusCode == http.StatusNotFound {
 			_ = resp.Body.Close()
-			return "", false, nil
+			return "", "", false, nil
 		}
 
 		if isRetryableHTTPStatus(resp.StatusCode) && attempt < retryPolicy.MaxRetries {
@@ -1168,7 +1190,7 @@ func fetchBeaconExecutionBlockHash(
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2048))
 			_ = resp.Body.Close()
 			if sleepErr := sleepForRetry(ctx, retryDelayHint); sleepErr != nil {
-				return "", false, sleepErr
+				return "", "", false, sleepErr
 			}
 			continue
 		}
@@ -1176,7 +1198,7 @@ func fetchBeaconExecutionBlockHash(
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 			_ = resp.Body.Close()
-			return "", false, fmt.Errorf("beacon response status %d from %s: %s", resp.StatusCode, endpoint, strings.TrimSpace(string(body)))
+			return "", "", false, fmt.Errorf("beacon response status %d from %s: %s", resp.StatusCode, endpoint, strings.TrimSpace(string(body)))
 		}
 
 		out := beaconBlockResponse{}
@@ -1186,25 +1208,33 @@ func fetchBeaconExecutionBlockHash(
 			lastErr = err
 			if attempt < retryPolicy.MaxRetries && isRetryableReadOrDecodeErr(err) {
 				if sleepErr := sleepForRetry(ctx, retryDelay(attempt, retryPolicy.BaseBackoff)); sleepErr != nil {
-					return "", false, sleepErr
+					return "", "", false, sleepErr
 				}
 				continue
 			}
-			return "", false, err
+			return "", "", false, err
 		}
 
 		blockHash := strings.TrimSpace(out.Data.Message.Body.ExecutionPayload.BlockHash)
 		if blockHash == "" {
 			blockHash = strings.TrimSpace(out.Data.Message.Body.ExecutionPayloadHeader.BlockHash)
 		}
+		feeRecipient := strings.TrimSpace(out.Data.Message.Body.ExecutionPayload.FeeRecipient)
+		if feeRecipient == "" {
+			feeRecipient = strings.TrimSpace(out.Data.Message.Body.ExecutionPayloadHeader.FeeRecipient)
+		}
+		normalizedFeeRecipient, err := normalizeAddress(feeRecipient)
+		if err == nil {
+			feeRecipient = normalizedFeeRecipient
+		}
 
-		return blockHash, true, nil
+		return blockHash, feeRecipient, true, nil
 	}
 
 	if lastErr != nil {
-		return "", false, lastErr
+		return "", "", false, lastErr
 	}
-	return "", false, fmt.Errorf("beacon block fetch failed for %s", endpoint)
+	return "", "", false, fmt.Errorf("beacon block fetch failed for %s", endpoint)
 }
 
 func (r RelayClient) fetchBidTraces(ctx context.Context, path string, slot uint64) ([]BidTrace, error) {
@@ -1411,10 +1441,65 @@ func sleepForRetry(ctx context.Context, d time.Duration) error {
 	}
 }
 
+func isETHGasRelayName(raw string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(raw)), "ethgas")
+}
+
+func normalizeAddress(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(raw, "0x") && !strings.HasPrefix(raw, "0X") {
+		return "", fmt.Errorf("address must start with 0x")
+	}
+	if len(raw) != 42 {
+		return "", fmt.Errorf("address must be 42 chars, got %d", len(raw))
+	}
+	for i := 2; i < len(raw); i++ {
+		c := raw[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return "", fmt.Errorf("address has non-hex character at position %d", i)
+		}
+	}
+	return strings.ToLower(raw), nil
+}
+
+func buildETHGasRelaySet(relays []RelayClient) map[string]struct{} {
+	out := make(map[string]struct{}, len(relays))
+	for _, relay := range relays {
+		if !relay.IsETHGas {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(relay.Name))
+		if key == "" {
+			continue
+		}
+		out[key] = struct{}{}
+	}
+	return out
+}
+
+func tagETHGasModes(results []SlotAnalysis, ethGasRelaySet map[string]struct{}, ethGasPoolAddr string) {
+	for i := range results {
+		mode := ""
+		for _, relay := range results[i].WinningRelays {
+			if _, ok := ethGasRelaySet[strings.ToLower(strings.TrimSpace(relay))]; ok {
+				mode = "ETHGasRelay"
+				break
+			}
+		}
+		if mode == "" && ethGasPoolAddr != "" && strings.EqualFold(results[i].BeaconFeeRecipient, ethGasPoolAddr) {
+			mode = "ETHGasExternal"
+		}
+		results[i].ETHGasMode = mode
+	}
+}
+
 func printSlotSummary(results []SlotAnalysis) {
 	fmt.Println("=== Slot Winner Summary ===")
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "SLOT\tBEACON_BLOCK_HASH\tWINNING_RELAYS\tWINNING_BID_ETH\tWIN_BID_MS_INTO_SLOT\tMAX_BID_ETH\tMAX_BID_MS_INTO_SLOT\tBID_COUNT\tNOTES")
+	fmt.Fprintln(w, "SLOT\tBEACON_BLOCK_HASH\tBEACON_FEE_RECIPIENT\tETHGAS_MODE\tWINNING_RELAYS\tWINNING_BID_ETH\tWIN_BID_MS_INTO_SLOT\tMAX_BID_ETH\tMAX_BID_MS_INTO_SLOT\tBID_COUNT\tNOTES")
 
 	for _, r := range results {
 		winningETH := "-"
@@ -1441,6 +1526,14 @@ func printSlotSummary(results []SlotAnalysis) {
 		if blockHash == "" {
 			blockHash = "-"
 		}
+		feeRecipient := r.BeaconFeeRecipient
+		if feeRecipient == "" {
+			feeRecipient = "-"
+		}
+		ethGasMode := r.ETHGasMode
+		if ethGasMode == "" {
+			ethGasMode = "-"
+		}
 
 		winner := r.WinningRelay
 		if winner == "" {
@@ -1454,9 +1547,11 @@ func printSlotSummary(results []SlotAnalysis) {
 
 		fmt.Fprintf(
 			w,
-			"%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+			"%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 			r.Slot,
 			blockHash,
+			feeRecipient,
+			ethGasMode,
 			winner,
 			winningETH,
 			winningMS,
@@ -1610,6 +1705,101 @@ func printAllBids(results []SlotAnalysis) {
 			msInto,
 			row.Bid.IsWinningBid,
 		)
+	}
+	_ = w.Flush()
+}
+
+func printETHGasModeStats(results []SlotAnalysis, ethGasPoolAddr string) {
+	fmt.Println("=== ETHGas Mode Stats ===")
+	totalBlocks := 0
+	ethGasRelayBlocks := 0
+	ethGasExternalBlocks := 0
+
+	for _, result := range results {
+		if !result.HasBeaconBlock {
+			continue
+		}
+		totalBlocks++
+		switch result.ETHGasMode {
+		case "ETHGasRelay":
+			ethGasRelayBlocks++
+		case "ETHGasExternal":
+			ethGasExternalBlocks++
+		}
+	}
+
+	if totalBlocks == 0 {
+		fmt.Println("No canonical beacon blocks found in the selected range.")
+		return
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "MODE\tBLOCK_COUNT\tPERCENT_OF_BLOCKS")
+	fmt.Fprintf(w, "ETHGasRelay\t%d\t%.2f%%\n", ethGasRelayBlocks, 100.0*float64(ethGasRelayBlocks)/float64(totalBlocks))
+	fmt.Fprintf(w, "ETHGasExternal\t%d\t%.2f%%\n", ethGasExternalBlocks, 100.0*float64(ethGasExternalBlocks)/float64(totalBlocks))
+	fmt.Fprintf(w, "ETHGas (total)\t%d\t%.2f%%\n", ethGasRelayBlocks+ethGasExternalBlocks, 100.0*float64(ethGasRelayBlocks+ethGasExternalBlocks)/float64(totalBlocks))
+	_ = w.Flush()
+
+	fmt.Printf("\nTotal canonical blocks: %d\n", totalBlocks)
+	if ethGasPoolAddr == "" {
+		fmt.Println("ETHGasExternal detection disabled: set -ethgas-pool-address to enable.")
+	} else {
+		fmt.Printf("ETHGas pool fee recipient: %s\n", ethGasPoolAddr)
+	}
+}
+
+func printPerRelayBidStats(results []SlotAnalysis) {
+	type relayAgg struct {
+		Count    int
+		TotalETH float64
+		MaxETH   float64
+	}
+
+	aggs := map[string]*relayAgg{}
+	for _, slotResult := range results {
+		for _, bid := range slotResult.Bids {
+			relay := strings.TrimSpace(bid.Relay)
+			if relay == "" {
+				relay = "-"
+			}
+			agg, ok := aggs[relay]
+			if !ok {
+				agg = &relayAgg{}
+				aggs[relay] = agg
+			}
+			agg.Count++
+			agg.TotalETH += bid.ValueETH
+			if agg.Count == 1 || bid.ValueETH > agg.MaxETH {
+				agg.MaxETH = bid.ValueETH
+			}
+		}
+	}
+
+	fmt.Println("=== Per-Relay Bid Stats ===")
+	if len(aggs) == 0 {
+		fmt.Println("No bids returned in selected range.")
+		return
+	}
+
+	names := make([]string, 0, len(aggs))
+	for name := range aggs {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		a := strings.ToLower(names[i])
+		b := strings.ToLower(names[j])
+		if a != b {
+			return a < b
+		}
+		return names[i] < names[j]
+	})
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "RELAY\tBID_COUNT\tAVG_BID_ETH\tMEAN_BID_ETH\tMAX_BID_ETH")
+	for _, name := range names {
+		agg := aggs[name]
+		mean := agg.TotalETH / float64(agg.Count)
+		fmt.Fprintf(w, "%s\t%d\t%.6f\t%.6f\t%.6f\n", name, agg.Count, mean, mean, agg.MaxETH)
 	}
 	_ = w.Flush()
 }

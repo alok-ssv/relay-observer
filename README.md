@@ -14,10 +14,17 @@ Query relay bid traces across a slot range (or time range), identify the winning
   - `builder_blocks_received`
   - `proposer_payload_delivered`
 - Pulls canonical beacon block data for each slot from a beacon API endpoint.
+- Tracks beacon `fee_recipient` per slot and classifies ETHGas mode as:
+  - `ETHGasRelay`: winning relay name/URL contains `ethgas`
+  - `ETHGasExternal`: non-ethgas winning relay, but beacon `fee_recipient` equals `-ethgas-pool-address`
 - Attributes winner as:
   - matching relay (strict canonical `block_hash` match), or
   - `self-built` if canonical block hash exists and no relay-delivered trace matches
 - Computes lateness-vs-reward stats for bids in-window.
+- Prints:
+  - slot winner summary (with `BEACON_FEE_RECIPIENT` and `ETHGAS_MODE`)
+  - ETHGas mode percentages across canonical blocks
+  - per-relay bid stats (`AVG`/`MEAN`/`MAX`)
 
 ## Prerequisites
 
@@ -79,6 +86,8 @@ Use time range instead of slot range:
     End slot (inclusive)
 -end-time string
     End time (RFC3339 or unix seconds/millis)
+-ethgas-pool-address string
+    EthGasPool fee recipient address (0x...) used to classify ETHGasExternal blocks
 -http-timeout duration
     HTTP timeout per request (default 10s)
 -max-retries int
@@ -106,6 +115,15 @@ Use time range instead of slot range:
   - reward is sourced from beacon `block rewards` API when available (`/eth/v1/beacon/rewards/blocks/{slot}`).
 - If `-allow-inferred-winner` is enabled:
   - when canonical matching is unavailable, winner can be inferred from highest delivered value trace.
+
+## ETHGas mode detection
+
+- `ETHGasRelay`:
+  - slot winner includes a relay whose configured name or URL contains `ethgas` (case-insensitive)
+- `ETHGasExternal`:
+  - winner is not from an `ethgas` relay, and
+  - beacon `fee_recipient` equals `-ethgas-pool-address`
+- If `-ethgas-pool-address` is not set, `ETHGasExternal` detection is disabled.
 
 ## Bid collection mode
 
