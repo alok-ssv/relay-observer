@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -116,6 +117,7 @@ type relaySlotFetch struct {
 type latenessAgg struct {
 	Count           int
 	TotalETH        float64
+	SumSquaresETH   float64
 	WinCount        int
 	WinningTotalETH float64
 	MaxBidETH       float64
@@ -1589,6 +1591,7 @@ func printLatenessStats(results []SlotAnalysis, bucketMS int64, allRelayBids boo
 
 			buckets[key].Count++
 			buckets[key].TotalETH += bid.ValueETH
+			buckets[key].SumSquaresETH += bid.ValueETH * bid.ValueETH
 			buckets[key].Slots[bid.Slot] = struct{}{}
 			if buckets[key].Count == 1 || bid.ValueETH > buckets[key].MaxBidETH {
 				buckets[key].MaxBidETH = bid.ValueETH
@@ -1626,7 +1629,7 @@ func printLatenessStats(results []SlotAnalysis, bucketMS int64, allRelayBids boo
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "BUCKET_MS_FROM_SLOT_START\tBID_COUNT\tSLOT_COUNT\tAVG_REWARD_ETH\tMEAN_BID_ETH\tMAX_BID_ETH\tWIN_SLOT_COUNT\tWIN_RATE")
+	fmt.Fprintln(w, "BUCKET_MS_FROM_SLOT_START\tBID_COUNT\tSLOT_COUNT\tAVG_REWARD_ETH\tMEAN_BID_ETH\tSTDDEV_BID_ETH\tMAX_BID_ETH\tWIN_SLOT_COUNT\tWIN_RATE")
 	for _, k := range keys {
 		agg := buckets[k]
 		slotCount := len(agg.Slots)
@@ -1636,12 +1639,13 @@ func printLatenessStats(results []SlotAnalysis, bucketMS int64, allRelayBids boo
 			avgReward = fmt.Sprintf("%.6f", agg.WinningTotalETH/float64(agg.WinCount))
 		}
 		meanBid := agg.TotalETH / float64(agg.Count)
+		stdDevBid := standardDeviation(agg.Count, agg.TotalETH, agg.SumSquaresETH)
 		winRate := 0.0
 		if slotCount > 0 {
 			winRate = 100.0 * float64(winSlotCount) / float64(slotCount)
 		}
 		label := fmt.Sprintf("[%d,%d)", k, k+bucketMS)
-		fmt.Fprintf(w, "%s\t%d\t%d\t%s\t%.6f\t%.6f\t%d\t%.2f%%\n", label, agg.Count, slotCount, avgReward, meanBid, agg.MaxBidETH, winSlotCount, winRate)
+		fmt.Fprintf(w, "%s\t%d\t%d\t%s\t%.6f\t%.6f\t%.6f\t%d\t%.2f%%\n", label, agg.Count, slotCount, avgReward, meanBid, stdDevBid, agg.MaxBidETH, winSlotCount, winRate)
 	}
 	_ = w.Flush()
 
@@ -1659,6 +1663,23 @@ func bucketStart(ms int64, bucketSize int64) int64 {
 		return (ms / bucketSize) * bucketSize
 	}
 	return -(((-ms + bucketSize - 1) / bucketSize) * bucketSize)
+}
+
+func standardDeviation(count int, sum float64, sumSquares float64) float64 {
+	if count <= 0 {
+		return 0
+	}
+	mean := sum / float64(count)
+	variance := (sumSquares / float64(count)) - (mean * mean)
+	if variance < 0 {
+		// Guard against tiny negative values from floating-point rounding.
+		if variance > -1e-12 {
+			variance = 0
+		} else {
+			return 0
+		}
+	}
+	return math.Sqrt(variance)
 }
 
 func printAllBids(results []SlotAnalysis) {
@@ -1750,9 +1771,10 @@ func printETHGasModeStats(results []SlotAnalysis, ethGasPoolAddr string) {
 
 func printPerRelayBidStats(results []SlotAnalysis) {
 	type relayAgg struct {
-		Count    int
-		TotalETH float64
-		MaxETH   float64
+		Count         int
+		TotalETH      float64
+		SumSquaresETH float64
+		MaxETH        float64
 	}
 
 	aggs := map[string]*relayAgg{}
@@ -1769,6 +1791,7 @@ func printPerRelayBidStats(results []SlotAnalysis) {
 			}
 			agg.Count++
 			agg.TotalETH += bid.ValueETH
+			agg.SumSquaresETH += bid.ValueETH * bid.ValueETH
 			if agg.Count == 1 || bid.ValueETH > agg.MaxETH {
 				agg.MaxETH = bid.ValueETH
 			}
@@ -1795,11 +1818,12 @@ func printPerRelayBidStats(results []SlotAnalysis) {
 	})
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "RELAY\tBID_COUNT\tAVG_BID_ETH\tMEAN_BID_ETH\tMAX_BID_ETH")
+	fmt.Fprintln(w, "RELAY\tBID_COUNT\tAVG_BID_ETH\tMEAN_BID_ETH\tSTDDEV_BID_ETH\tMAX_BID_ETH")
 	for _, name := range names {
 		agg := aggs[name]
 		mean := agg.TotalETH / float64(agg.Count)
-		fmt.Fprintf(w, "%s\t%d\t%.6f\t%.6f\t%.6f\n", name, agg.Count, mean, mean, agg.MaxETH)
+		stdDev := standardDeviation(agg.Count, agg.TotalETH, agg.SumSquaresETH)
+		fmt.Fprintf(w, "%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\n", name, agg.Count, mean, mean, stdDev, agg.MaxETH)
 	}
 	_ = w.Flush()
 }
